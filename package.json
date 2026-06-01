@@ -1,0 +1,34 @@
+{
+  "name": "opencode-loop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Run fresh OpenCode agents over prompt-driven task loops",
+  "type": "module",
+  "bin": {
+    "opencode-loop": "./dist/index.js"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc && chmod +x dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "opencode",
+    "sdk",
+    "automation",
+    "cli",
+    "agent"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.15.13"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  }
+}
