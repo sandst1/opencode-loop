@@ -44,6 +44,13 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
     const connectedPromise = new Promise<void>(r => { resolveConnected = r; });
     const idlePromise = new Promise<string | undefined>(r => { resolveIdle = r; });
 
+    // Only stream text from assistant messages, not the user's own prompt echo.
+    const assistantMessageIds = new Set<string>();
+    // Track per-part character offsets for incremental output (delta may be absent).
+    const partOffsets = new Map<string, number>();
+    // Parts seen so far — used to insert a newline between distinct parts.
+    const seenParts = new Set<string>();
+
     // Start consuming SSE events as a background task. Doing this before
     // calling promptAsync ensures the SSE fetch is already in-flight (and we
     // wait for server.connected below) so we can't miss any events.
@@ -51,10 +58,33 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
       for await (const event of stream) {
         if (event.type === "server.connected") {
           resolveConnected();
+        } else if (event.type === "message.updated") {
+          const { info } = event.properties;
+          if (info.sessionID === sessionId && info.role === "assistant") {
+            assistantMessageIds.add(info.id);
+            if (info.error) {
+              resolveIdle(formatSessionError(info.error));
+            }
+          }
         } else if (event.type === "message.part.updated") {
-          const { part, delta } = event.properties;
-          if (part.sessionID === sessionId && part.type === "text" && delta) {
-            options.stream?.(delta);
+          const { part } = event.properties;
+          if (
+            part.sessionID === sessionId &&
+            part.type === "text" &&
+            assistantMessageIds.has(part.messageID)
+          ) {
+            const prev = partOffsets.get(part.id) ?? 0;
+            const newText = part.text.slice(prev);
+            if (newText) {
+              if (!seenParts.has(part.id)) {
+                // Newline before each new part: separates the header line from
+                // the first part, and separates consecutive parts from each other.
+                options.stream?.("\n");
+                seenParts.add(part.id);
+              }
+              options.stream?.(newText);
+              partOffsets.set(part.id, part.text.length);
+            }
           }
         } else if (event.type === "session.idle") {
           if (event.properties.sessionID === sessionId) {
@@ -65,12 +95,6 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
           if (event.properties.sessionID === sessionId) {
             resolveIdle(formatSessionError(event.properties.error));
             break;
-          }
-        } else if (event.type === "message.updated") {
-          // Surface errors that appear on the assistant message itself.
-          const { info } = event.properties;
-          if (info.role === "assistant" && info.sessionID === sessionId && info.error) {
-            resolveIdle(formatSessionError(info.error));
           }
         }
       }
