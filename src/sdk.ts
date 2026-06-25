@@ -1,10 +1,20 @@
 import { createOpencode } from "@opencode-ai/sdk";
 
+export type StatusEvent =
+  | { kind: "thinking"; text: string }
+  | { kind: "tool-pending"; tool: string }
+  | { kind: "tool-running"; tool: string; title?: string }
+  | { kind: "tool-completed"; tool: string; title: string }
+  | { kind: "tool-error"; tool: string; error: string }
+  | { kind: "step-finish"; tokens: { input: number; output: number; reasoning: number } }
+  | { kind: "file-patch"; files: string[] };
+
 export interface RunAgentOptions {
   prompt: string;
   model?: string;
   cwd: string;
   stream?: (text: string) => void;
+  onStatus?: (event: StatusEvent) => void;
 }
 
 export type AgentRunOutcome =
@@ -68,23 +78,43 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
           }
         } else if (event.type === "message.part.updated") {
           const { part } = event.properties;
-          if (
-            part.sessionID === sessionId &&
-            part.type === "text" &&
-            assistantMessageIds.has(part.messageID)
-          ) {
+          if (part.sessionID !== sessionId || !assistantMessageIds.has(part.messageID)) {
+            continue;
+          }
+
+          if (part.type === "text") {
             const prev = partOffsets.get(part.id) ?? 0;
             const newText = part.text.slice(prev);
             if (newText) {
               if (!seenParts.has(part.id)) {
-                // Newline before each new part: separates the header line from
-                // the first part, and separates consecutive parts from each other.
                 options.stream?.("\n");
                 seenParts.add(part.id);
               }
               options.stream?.(newText);
               partOffsets.set(part.id, part.text.length);
             }
+          } else if (part.type === "reasoning") {
+            const prev = partOffsets.get(part.id) ?? 0;
+            const newText = part.text.slice(prev);
+            if (newText) {
+              options.onStatus?.({ kind: "thinking", text: newText });
+              partOffsets.set(part.id, part.text.length);
+            }
+          } else if (part.type === "tool") {
+            const { state, tool } = part;
+            if (state.status === "pending") {
+              options.onStatus?.({ kind: "tool-pending", tool });
+            } else if (state.status === "running") {
+              options.onStatus?.({ kind: "tool-running", tool, title: state.title });
+            } else if (state.status === "completed") {
+              options.onStatus?.({ kind: "tool-completed", tool, title: state.title });
+            } else if (state.status === "error") {
+              options.onStatus?.({ kind: "tool-error", tool, error: state.error });
+            }
+          } else if (part.type === "step-finish") {
+            options.onStatus?.({ kind: "step-finish", tokens: part.tokens });
+          } else if (part.type === "patch") {
+            options.onStatus?.({ kind: "file-patch", files: part.files });
           }
         } else if (event.type === "session.idle") {
           if (event.properties.sessionID === sessionId) {
