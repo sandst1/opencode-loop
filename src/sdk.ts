@@ -164,6 +164,36 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
       return { kind: "run-error", error: errorMessage };
     }
 
+    // Some providers (e.g. GitHub Copilot) don't emit message.part.updated
+    // SSE events, and the SSE stream can close before the session is done.
+    // When nothing was streamed, poll session status until actually idle,
+    // then fetch messages via REST as a fallback.
+    if (seenParts.size === 0 && options.stream) {
+      await pollUntilSessionIdle(client, sessionId, options.cwd);
+
+      const msgsRes = await client.session.messages({
+        path: { id: sessionId },
+        query: { directory: options.cwd },
+      });
+      const messages = (msgsRes.data ?? []) as Array<{
+        info: { role: string };
+        parts?: Array<{ type: string; text?: string }>;
+      }>;
+      let firstPart = true;
+      for (const msg of messages) {
+        if (msg.info.role !== "assistant") continue;
+        for (const part of msg.parts ?? []) {
+          if (part.type === "text" && part.text) {
+            if (firstPart) {
+              options.stream("\n");
+              firstPart = false;
+            }
+            options.stream(part.text);
+          }
+        }
+      }
+    }
+
     return { kind: "finished" };
   } catch (error) {
     return {
@@ -211,6 +241,29 @@ function formatApiError(error: unknown): string | undefined {
     if (typeof d["message"] === "string") return d["message"];
   }
   return JSON.stringify(error);
+}
+
+async function pollUntilSessionIdle(
+  client: Awaited<ReturnType<typeof createOpencode>>["client"],
+  sessionId: string,
+  cwd: string,
+  intervalMs = 500,
+  timeoutMs = 300_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let seenBusy = false;
+  while (Date.now() < deadline) {
+    const res = await client.session.status({ query: { directory: cwd } });
+    const statusMap = res.data as Record<string, { type: string }> | undefined;
+    const status = statusMap?.[sessionId];
+    if (status?.type === "busy" || status?.type === "retry") {
+      seenBusy = true;
+    } else if (seenBusy) {
+      // Was busy, now absent from map (= done) or explicitly idle.
+      return;
+    }
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
 }
 
 function formatSessionError(
