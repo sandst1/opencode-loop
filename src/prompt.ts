@@ -38,7 +38,13 @@ export function renderPrompt(template: string, context: PromptContext): string {
 
   if (!context.task || !context.taskFile) return rendered;
 
+  // User instructions come first so skill/process guidance is not buried under
+  // the loop's scope constraints. Scope rules limit *which* task to finish,
+  // not *how* (skills, tools, and other process still apply).
   return `You are running inside opencode-loop.
+
+User instructions:
+${rendered}
 
 Selected task:
 - Text: ${context.task.text}
@@ -47,12 +53,9 @@ Selected task:
 - Current iteration: ${context.iteration}
 - Working directory: ${context.cwd}
 
-Strict rules:
-- Do exactly the selected task above.
-- Do not complete, edit, or check off any other unchecked task in the task file.
-- When the selected task is complete, update only that selected checkbox from [ ] to [x].
-- Stop after the selected task is complete.
-
-User instructions:
-${rendered}`;
+Scope (one task only):
+- Complete only the selected task above — do not start or check off other unchecked tasks.
+- Follow the user instructions above, including any skills or process they require.
+- Use available skills and tools as needed to do the work well; scope limits which task, not how you work.
+- When the selected task is complete, update only that checkbox from [ ] to [x], then stop.`;
 }

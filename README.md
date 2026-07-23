@@ -111,7 +111,7 @@ Task selection is deterministic. Each iteration rereads the task file and picks 
 
 Progress is shown against the number of unchecked tasks found at startup. If the file starts with five unchecked tasks, the runs are shown as `task 1/5`, `task 2/5`, and so on. With `--limit 3`, the total is capped at `3`.
 
-When `--pick-tasks-from` is used, opencode-loop wraps your prompt in strict single-task instructions. The agent receives the selected checkbox text, file, and line number, and is told to complete only that checkbox before stopping. Assistant output is streamed as the agent works, so progress is visible during each iteration.
+When `--pick-tasks-from` is used, opencode-loop wraps your prompt with single-task scope: your instructions (including skills/process) come first, then the selected checkbox, file, and line. The agent must finish only that checkbox before stopping — scope limits *which* task, not *how* (skills and tools still apply). Assistant output is streamed as the agent works, so progress is visible during each iteration.
 
 The selected task is injected into the prompt template with these variables:
 
