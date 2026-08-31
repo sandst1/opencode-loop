@@ -42,7 +42,7 @@ Flags:
   --model <provider/model>     OpenCode model id, e.g. anthropic/claude-sonnet-4-5.
                                Defaults to the model set in your opencode.json config.
   --limit <number>             Maximum task iterations. Without --pick-tasks-from, the prompt runs once.
-  --session-timeout <seconds>  Abort a run that does not finish in this time. Default: 300.
+  --session-timeout <seconds>  Abort after this long without progress. Default: 900.
   --cwd <path>                 Working directory passed to OpenCode. Default: current directory.
   --auto                       Auto-approve OpenCode permission prompts (default).
   --no-auto                    Leave permission prompts unanswered. The loop will hang on ask.

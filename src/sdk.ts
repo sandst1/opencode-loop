@@ -18,7 +18,7 @@ export interface RunAgentOptions {
   prompt: string;
   model?: string;
   cwd: string;
-  /** Maximum time to wait for the session to finish. Default: 5 minutes. */
+  /** Maximum time without session progress before aborting. Default: 15 minutes. */
   sessionIdleTimeoutMs?: number;
   /** Auto-approve OpenCode permission prompts. Default: true. */
   auto?: boolean;
@@ -48,7 +48,7 @@ const START_ATTEMPTS = 6;
 const START_RETRY_BASE_MS = 300;
 const START_RETRY_MAX_MS = 3_000;
 const SQLITE_RELEASE_MS = 400;
-const SESSION_IDLE_TIMEOUT_MS = 300_000;
+const SESSION_IDLE_TIMEOUT_MS = 900_000;
 const SESSION_WAIT_STATUS_INTERVAL_MS = 30_000;
 
 export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunOutcome> {
@@ -78,11 +78,15 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
 
     const connectedPromise = new Promise<void>(r => { resolveConnected = r; });
     const idlePromise = new Promise<string | undefined>(r => { resolveIdle = r; });
+    let noteSessionProgress = (): void => {};
+    let lastSessionStatus: string | undefined;
 
     // Only stream text from assistant messages, not the user's own prompt echo.
     const assistantMessageIds = new Set<string>();
     // Track per-part character offsets for incremental output (delta may be absent).
     const partOffsets = new Map<string, number>();
+    const partProgress = new Map<string, string>();
+    const messageProgress = new Map<string, string>();
     // Parts seen so far — used to insert a newline between distinct parts.
     const seenParts = new Set<string>();
     const handledPermissionIds = new Set<string>();
@@ -91,6 +95,7 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
       if (request.sessionID !== sessionId) return;
       if (handledPermissionIds.has(request.id)) return;
       handledPermissionIds.add(request.id);
+      noteSessionProgress();
 
       if (!auto) {
         options.onStatus?.({ kind: "permission-ask", permission: request.name });
@@ -126,6 +131,11 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
         } else if (event.type === "message.updated") {
           const { info } = event.properties;
           if (info.sessionID === sessionId && info.role === "assistant") {
+            const progressKey = `${info.time.completed ?? ""}:${info.finish ?? ""}:${info.error?.name ?? ""}`;
+            if (messageProgress.get(info.id) !== progressKey) {
+              messageProgress.set(info.id, progressKey);
+              noteSessionProgress();
+            }
             assistantMessageIds.add(info.id);
             if (info.error) {
               resolveIdle(formatSessionError(info.error));
@@ -135,6 +145,15 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
           const { part } = event.properties;
           if (part.sessionID !== sessionId || !assistantMessageIds.has(part.messageID)) {
             continue;
+          }
+          const progressKey = part.type === "text" || part.type === "reasoning"
+            ? `${part.type}:${part.text.length}`
+            : part.type === "tool"
+              ? `${part.type}:${part.state.status}:${JSON.stringify("time" in part.state ? part.state.time : {})}`
+              : JSON.stringify(part);
+          if (partProgress.get(part.id) !== progressKey) {
+            partProgress.set(part.id, progressKey);
+            noteSessionProgress();
           }
 
           if (part.type === "text") {
@@ -170,6 +189,17 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
             options.onStatus?.({ kind: "step-finish", tokens: part.tokens });
           } else if (part.type === "patch") {
             options.onStatus?.({ kind: "file-patch", files: part.files });
+          }
+        } else if (event.type === "session.status") {
+          if (event.properties.sessionID === sessionId) {
+            const status = event.properties.status;
+            const statusKey = status.type === "retry"
+              ? `${status.type}:${status.attempt}:${status.next}`
+              : status.type;
+            if (statusKey !== lastSessionStatus) {
+              lastSessionStatus = statusKey;
+              noteSessionProgress();
+            }
           }
         } else if (event.type === "session.idle") {
           if (event.properties.sessionID === sessionId) {
@@ -216,13 +246,14 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
 
     // Do not rely solely on SSE: some providers keep the stream open without
     // sending session.idle, while others close it before the run is finished.
-    // Race SSE against REST status polling and an absolute deadline.
+    // Race SSE against REST status polling and an inactivity watchdog.
     const sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? SESSION_IDLE_TIMEOUT_MS;
-    const startedWaitingAt = Date.now();
+    const watchdog = createInactivityWatchdog(sessionIdleTimeoutMs);
+    noteSessionProgress = watchdog.reset;
     const waitStatusTask = reportSessionWait({
       signal: controller.signal,
-      startedAt: startedWaitingAt,
       timeoutMs: sessionIdleTimeoutMs,
+      inactiveForMs: watchdog.inactiveForMs,
       onStatus: options.onStatus,
     });
     const statusTask = pollUntilSessionIdle({
@@ -230,17 +261,14 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
       sessionId,
       cwd: options.cwd,
       signal: controller.signal,
-    });
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const timeoutTask = new Promise<SessionCompletion>(resolve => {
-      timeout = setTimeout(() => resolve({ timedOut: true }), sessionIdleTimeoutMs);
+      onProgress: watchdog.reset,
     });
     const completion = await Promise.race([
       idlePromise.then<SessionCompletion>(error => ({ done: true, error })),
       statusTask,
-      timeoutTask,
+      watchdog.promise,
     ]);
-    if (timeout) clearTimeout(timeout);
+    watchdog.stop();
     controller.abort();
     await Promise.allSettled([consumeTask, pollTask, statusTask, waitStatusTask]);
 
@@ -248,7 +276,7 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
       await abortSession(client, sessionId, options.cwd);
       return {
         kind: "run-error",
-        error: `Session did not become idle within ${formatDuration(sessionIdleTimeoutMs)}; aborted`,
+        error: `Session made no progress for ${formatDuration(sessionIdleTimeoutMs)}; aborted`,
       };
     }
 
@@ -611,17 +639,25 @@ async function pollUntilSessionIdle(
     cwd: string;
     signal: AbortSignal;
     intervalMs?: number;
+    onProgress: () => void;
   },
 ): Promise<SessionCompletion> {
   let seenBusy = false;
+  let previousStatus: string | undefined;
   while (!options.signal.aborted) {
     try {
       const res = await options.client.session.status({
         query: { directory: options.cwd },
         signal: options.signal,
       });
-      const statusMap = res.data as Record<string, { type: string }> | undefined;
-      const status = statusMap?.[options.sessionId];
+      const status = res.data?.[options.sessionId];
+      const statusKey = status?.type === "retry"
+        ? `${status.type}:${status.attempt}:${status.next}`
+        : status?.type ?? "absent";
+      if (statusKey !== previousStatus) {
+        previousStatus = statusKey;
+        options.onProgress();
+      }
       if (status?.type === "busy" || status?.type === "retry") {
         seenBusy = true;
       } else if (status?.type === "idle" || (seenBusy && !status)) {
@@ -652,6 +688,37 @@ interface SessionCompletion {
   done?: boolean;
   error?: string;
   timedOut?: boolean;
+}
+
+function createInactivityWatchdog(timeoutMs: number): {
+  promise: Promise<SessionCompletion>;
+  reset: () => void;
+  stop: () => void;
+  inactiveForMs: () => number;
+} {
+  let lastProgressAt = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let resolveTimeout!: (completion: SessionCompletion) => void;
+  const promise = new Promise<SessionCompletion>(resolve => {
+    resolveTimeout = resolve;
+  });
+  const arm = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => resolveTimeout({ timedOut: true }), timeoutMs);
+  };
+  const reset = (): void => {
+    lastProgressAt = Date.now();
+    arm();
+  };
+  arm();
+  return {
+    promise,
+    reset,
+    stop: () => {
+      if (timer) clearTimeout(timer);
+    },
+    inactiveForMs: () => Date.now() - lastProgressAt,
+  };
 }
 
 async function getSessionCompletion(
@@ -692,8 +759,8 @@ async function abortSession(client: OpencodeClient, sessionId: string, cwd: stri
 
 async function reportSessionWait(options: {
   signal: AbortSignal;
-  startedAt: number;
   timeoutMs: number;
+  inactiveForMs: () => number;
   onStatus?: (event: StatusEvent) => void;
 }): Promise<void> {
   while (!options.signal.aborted) {
@@ -701,7 +768,7 @@ async function reportSessionWait(options: {
     if (options.signal.aborted) return;
     options.onStatus?.({
       kind: "session-wait",
-      elapsedMs: Date.now() - options.startedAt,
+      elapsedMs: options.inactiveForMs(),
       timeoutMs: options.timeoutMs,
     });
   }

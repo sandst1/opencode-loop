@@ -192,7 +192,7 @@ function writeStatus(event: StatusEvent): void {
       endThinking();
       const elapsed = Math.round(event.elapsedMs / 1_000);
       const timeout = Math.round(event.timeoutMs / 1_000);
-      process.stderr.write(dim(`\n[waiting for provider: ${elapsed}s/${timeout}s]`));
+      process.stderr.write(dim(`\n[waiting: ${elapsed}s inactive/${timeout}s limit]`));
       break;
     }
     case "tool-pending": {
