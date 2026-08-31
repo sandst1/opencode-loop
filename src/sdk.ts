@@ -3,6 +3,7 @@ import { createOpencode, type Config, type OpencodeClient } from "@opencode-ai/s
 
 export type StatusEvent =
   | { kind: "thinking"; text: string }
+  | { kind: "session-wait"; elapsedMs: number; timeoutMs: number }
   | { kind: "tool-pending"; tool: string }
   | { kind: "tool-running"; tool: string; title?: string }
   | { kind: "tool-completed"; tool: string; title: string }
@@ -17,6 +18,8 @@ export interface RunAgentOptions {
   prompt: string;
   model?: string;
   cwd: string;
+  /** Maximum time to wait for the session to finish. Default: 5 minutes. */
+  sessionIdleTimeoutMs?: number;
   /** Auto-approve OpenCode permission prompts. Default: true. */
   auto?: boolean;
   stream?: (text: string) => void;
@@ -45,6 +48,8 @@ const START_ATTEMPTS = 6;
 const START_RETRY_BASE_MS = 300;
 const START_RETRY_MAX_MS = 3_000;
 const SQLITE_RELEASE_MS = 400;
+const SESSION_IDLE_TIMEOUT_MS = 300_000;
+const SESSION_WAIT_STATUS_INTERVAL_MS = 30_000;
 
 export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunOutcome> {
   let opencode: OpencodeRuntime | undefined = options.runtime;
@@ -178,9 +183,6 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
           }
         }
       }
-      // If the stream ends without an idle event (e.g. server closed), resolve
-      // so callers don't hang.
-      resolveIdle(undefined);
     })();
 
     // Wait until the SSE connection is open before firing the prompt so we
@@ -212,22 +214,52 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
       return { kind: "run-error", error: formatApiError(promptRes.error) ?? "Prompt rejected" };
     }
 
-    // Wait for session.idle (or session.error) via the background consumer.
-    const errorMessage = await idlePromise;
+    // Do not rely solely on SSE: some providers keep the stream open without
+    // sending session.idle, while others close it before the run is finished.
+    // Race SSE against REST status polling and an absolute deadline.
+    const sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? SESSION_IDLE_TIMEOUT_MS;
+    const startedWaitingAt = Date.now();
+    const waitStatusTask = reportSessionWait({
+      signal: controller.signal,
+      startedAt: startedWaitingAt,
+      timeoutMs: sessionIdleTimeoutMs,
+      onStatus: options.onStatus,
+    });
+    const statusTask = pollUntilSessionIdle({
+      client,
+      sessionId,
+      cwd: options.cwd,
+      signal: controller.signal,
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutTask = new Promise<SessionCompletion>(resolve => {
+      timeout = setTimeout(() => resolve({ timedOut: true }), sessionIdleTimeoutMs);
+    });
+    const completion = await Promise.race([
+      idlePromise.then<SessionCompletion>(error => ({ done: true, error })),
+      statusTask,
+      timeoutTask,
+    ]);
+    if (timeout) clearTimeout(timeout);
     controller.abort();
-    await Promise.allSettled([consumeTask, pollTask]);
+    await Promise.allSettled([consumeTask, pollTask, statusTask, waitStatusTask]);
 
-    if (errorMessage) {
-      return { kind: "run-error", error: errorMessage };
+    if (completion.timedOut) {
+      await abortSession(client, sessionId, options.cwd);
+      return {
+        kind: "run-error",
+        error: `Session did not become idle within ${formatDuration(sessionIdleTimeoutMs)}; aborted`,
+      };
+    }
+
+    if (completion.error) {
+      return { kind: "run-error", error: completion.error };
     }
 
     // Some providers (e.g. GitHub Copilot) don't emit message.part.updated
-    // SSE events, and the SSE stream can close before the session is done.
-    // When nothing was streamed, poll session status until actually idle,
-    // then fetch messages via REST as a fallback.
+    // SSE events. Once either SSE or polling confirms completion, fetch
+    // messages via REST as a fallback.
     if (seenParts.size === 0 && options.stream) {
-      await pollUntilSessionIdle(client, sessionId, options.cwd);
-
       const msgsRes = await client.session.messages({
         path: { id: sessionId },
         query: { directory: options.cwd },
@@ -573,26 +605,112 @@ function formatApiError(error: unknown): string | undefined {
 }
 
 async function pollUntilSessionIdle(
-  client: Awaited<ReturnType<typeof createOpencode>>["client"],
+  options: {
+    client: OpencodeClient;
+    sessionId: string;
+    cwd: string;
+    signal: AbortSignal;
+    intervalMs?: number;
+  },
+): Promise<SessionCompletion> {
+  let seenBusy = false;
+  while (!options.signal.aborted) {
+    try {
+      const res = await options.client.session.status({
+        query: { directory: options.cwd },
+        signal: options.signal,
+      });
+      const statusMap = res.data as Record<string, { type: string }> | undefined;
+      const status = statusMap?.[options.sessionId];
+      if (status?.type === "busy" || status?.type === "retry") {
+        seenBusy = true;
+      } else if (status?.type === "idle" || (seenBusy && !status)) {
+        return getSessionCompletion(options.client, options.sessionId, options.cwd, true, options.signal);
+      } else if (!status) {
+        // The status map only contains active sessions. If polling starts after
+        // a fast run completed, busy may never be observed; a completed
+        // assistant message distinguishes that case from a request that never
+        // reached the provider.
+        const completion = await getSessionCompletion(
+          options.client,
+          options.sessionId,
+          options.cwd,
+          false,
+          options.signal,
+        );
+        if (completion.done) return completion;
+      }
+    } catch (error) {
+      if (options.signal.aborted) return {};
+    }
+    await sleep(options.intervalMs ?? 500, options.signal);
+  }
+  return {};
+}
+
+interface SessionCompletion {
+  done?: boolean;
+  error?: string;
+  timedOut?: boolean;
+}
+
+async function getSessionCompletion(
+  client: OpencodeClient,
   sessionId: string,
   cwd: string,
-  intervalMs = 500,
-  timeoutMs = 300_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  let seenBusy = false;
-  while (Date.now() < deadline) {
-    const res = await client.session.status({ query: { directory: cwd } });
-    const statusMap = res.data as Record<string, { type: string }> | undefined;
-    const status = statusMap?.[sessionId];
-    if (status?.type === "busy" || status?.type === "retry") {
-      seenBusy = true;
-    } else if (seenBusy) {
-      // Was busy, now absent from map (= done) or explicitly idle.
-      return;
-    }
-    await new Promise(r => setTimeout(r, intervalMs));
+  assumeDone: boolean,
+  signal: AbortSignal,
+): Promise<SessionCompletion> {
+  const res = await client.session.messages({
+    path: { id: sessionId },
+    query: { directory: cwd },
+    signal,
+  });
+  const messages = res.data ?? [];
+  const assistants = messages.filter(message => message.info.role === "assistant");
+  const last = assistants.at(-1);
+  if (!last || last.info.role !== "assistant") return { done: assumeDone };
+  if (last.info.error) {
+    return { done: true, error: formatSessionError(last.info.error) };
   }
+  return {
+    done: assumeDone || last.info.time.completed !== undefined || last.info.finish !== undefined,
+  };
+}
+
+async function abortSession(client: OpencodeClient, sessionId: string, cwd: string): Promise<void> {
+  try {
+    await client.session.abort({
+      path: { id: sessionId },
+      query: { directory: cwd },
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch {
+    // The local server may already be gone; timeout recovery must still return.
+  }
+}
+
+async function reportSessionWait(options: {
+  signal: AbortSignal;
+  startedAt: number;
+  timeoutMs: number;
+  onStatus?: (event: StatusEvent) => void;
+}): Promise<void> {
+  while (!options.signal.aborted) {
+    await sleep(SESSION_WAIT_STATUS_INTERVAL_MS, options.signal);
+    if (options.signal.aborted) return;
+    options.onStatus?.({
+      kind: "session-wait",
+      elapsedMs: Date.now() - options.startedAt,
+      timeoutMs: options.timeoutMs,
+    });
+  }
+}
+
+function formatDuration(ms: number): string {
+  if (ms % 60_000 === 0) return `${ms / 60_000} minutes`;
+  if (ms % 1_000 === 0) return `${ms / 1_000} seconds`;
+  return `${ms}ms`;
 }
 
 function formatSessionError(

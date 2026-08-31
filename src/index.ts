@@ -90,6 +90,7 @@ async function run(command: RunCommand): Promise<void> {
         model: command.model,
         cwd,
         auto: command.auto,
+        sessionIdleTimeoutMs: command.sessionTimeoutMs,
         runtime,
         stream: (text) => {
           process.stdout.write(text);
@@ -185,6 +186,13 @@ function writeStatus(event: StatusEvent): void {
         process.stderr.write(dim("\n[thinking] "));
       }
       process.stderr.write(dim(event.text));
+      break;
+    }
+    case "session-wait": {
+      endThinking();
+      const elapsed = Math.round(event.elapsedMs / 1_000);
+      const timeout = Math.round(event.timeoutMs / 1_000);
+      process.stderr.write(dim(`\n[waiting for provider: ${elapsed}s/${timeout}s]`));
       break;
     }
     case "tool-pending": {

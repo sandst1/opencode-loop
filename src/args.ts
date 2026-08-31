@@ -7,6 +7,7 @@ export interface RunCommand {
   pickTasksFrom?: string;
   model?: string;
   limit?: number;
+  sessionTimeoutMs?: number;
   cwd: string;
   /** Auto-approve OpenCode permission prompts. Default: true. */
   auto: boolean;
@@ -41,6 +42,7 @@ Flags:
   --model <provider/model>     OpenCode model id, e.g. anthropic/claude-sonnet-4-5.
                                Defaults to the model set in your opencode.json config.
   --limit <number>             Maximum task iterations. Without --pick-tasks-from, the prompt runs once.
+  --session-timeout <seconds>  Abort a run that does not finish in this time. Default: 300.
   --cwd <path>                 Working directory passed to OpenCode. Default: current directory.
   --auto                       Auto-approve OpenCode permission prompts (default).
   --no-auto                    Leave permission prompts unanswered. The loop will hang on ask.
@@ -115,6 +117,15 @@ function parseRun(args: string[]): RunCommand | HelpCommand {
           throw new Error("--limit must be a positive integer");
         }
         command.limit = parsed;
+        break;
+      }
+      case "--session-timeout": {
+        const rawTimeout = readFlagValue(args, ++index, arg);
+        const seconds = Number(rawTimeout);
+        if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 2_147_483) {
+          throw new Error("--session-timeout must be a positive integer number of seconds");
+        }
+        command.sessionTimeoutMs = seconds * 1_000;
         break;
       }
       case "--cwd":

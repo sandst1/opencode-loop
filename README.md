@@ -81,6 +81,12 @@ Limit how many checkbox tasks to run:
 opencode-loop --prompt-file prompt.md --pick-tasks-from docs/task-plan.md --limit 3
 ```
 
+Set a shorter deadline for a provider that can stall (the default is 300 seconds):
+
+```bash
+opencode-loop --session-timeout 90 --model github-copilot/claude-opus-4.6 --prompt-file prompt.md
+```
+
 Leave permission prompts to OpenCode (the loop will hang if anything asks):
 
 ```bash
@@ -161,6 +167,10 @@ If `--pick-tasks-from` is used without `--prompt` or `--prompt-file`, `opencode-
 ## Output
 
 Agent replies are saved to `opencode-loop-output/reply-{N}.md` in the working directory.
+
+The loop checks completion through both SSE events and the session status API. While
+a provider is quiet, it prints a waiting message every 30 seconds. If the session
+deadline expires, the loop aborts the OpenCode session and exits with code 2.
 
 ## Exit Codes
 
