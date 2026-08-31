@@ -109,7 +109,7 @@ If `--model` is omitted, OpenCode uses the `model` field from your `opencode.jso
 
 ## Config
 
-`opencode-loop` starts an OpenCode server internally per iteration. It automatically loads your full OpenCode config chain:
+`opencode-loop` starts one OpenCode server for the run and creates a fresh session per iteration. It automatically loads your full OpenCode config chain:
 
 1. Remote config (`.well-known/opencode`)
 2. Global config (`~/.config/opencode/opencode.json`) — your models, providers, and auth

@@ -1,3 +1,4 @@
+import { createServer } from "node:net";
 import { createOpencode, type Config, type OpencodeClient } from "@opencode-ai/sdk";
 
 export type StatusEvent =
@@ -20,6 +21,8 @@ export interface RunAgentOptions {
   auto?: boolean;
   stream?: (text: string) => void;
   onStatus?: (event: StatusEvent) => void;
+  /** Reuse an already-running OpenCode server. Caller is responsible for stopping it. */
+  runtime?: OpencodeRuntime;
 }
 
 const ALLOW_PERMISSION = {
@@ -35,33 +38,34 @@ export type AgentRunOutcome =
   | { kind: "run-error"; error: string }
   | { kind: "startup-error"; error: string };
 
+export type OpencodeRuntime = Awaited<ReturnType<typeof createOpencode>>;
+
+const SERVER_START_TIMEOUT_MS = 20_000;
+const START_ATTEMPTS = 6;
+const START_RETRY_BASE_MS = 300;
+const START_RETRY_MAX_MS = 3_000;
+const SQLITE_RELEASE_MS = 400;
+
 export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunOutcome> {
-  let opencode: Awaited<ReturnType<typeof createOpencode>> | undefined;
+  let opencode: OpencodeRuntime | undefined = options.runtime;
+  const ownsServer = options.runtime === undefined;
   let controller: AbortController | undefined;
 
   try {
     const auto = options.auto !== false;
-    opencode = await createOpencode({
-      config: buildServerConfig(options.model, auto),
-    });
+    if (!opencode) {
+      opencode = await startOpencodeRuntime({ model: options.model, auto });
+    }
     const { client } = opencode;
     const serverUrl = opencode.server.url;
 
-    const sessionRes = await client.session.create({
-      body: { title: "opencode-loop" },
-      query: { directory: options.cwd },
-    });
-
-    if (!sessionRes.data) {
-      const msg = formatApiError(sessionRes.error) ?? "Failed to create session";
-      return { kind: "startup-error", error: msg };
-    }
-
-    const sessionId = sessionRes.data.id;
+    const sessionId = await createSession(client, options.cwd);
     const parsedModel = options.model ? parseModel(options.model) : undefined;
 
     controller = new AbortController();
-    const { stream } = await client.event.subscribe({ signal: controller.signal });
+    const { stream } = await withTransientRetries("OpenCode event subscribe", () =>
+      client.event.subscribe({ signal: controller!.signal }),
+    );
 
     // Signals used to coordinate the background consumer with the main flow.
     let resolveConnected!: () => void;
@@ -255,12 +259,46 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
     };
   } finally {
     controller?.abort();
-    opencode?.server.close();
+    if (ownsServer) {
+      await stopOpencodeRuntime(opencode);
+    }
   }
 }
 
+export async function startOpencodeRuntime(options: {
+  model?: string;
+  auto: boolean;
+}): Promise<OpencodeRuntime> {
+  return withTransientRetries("OpenCode server start", async () => {
+    const port = await allocateListenPort();
+    const opencode = await createOpencode({
+      hostname: "127.0.0.1",
+      // SDK and this OpenCode build both treat port 0 as 4096, which races
+      // the previous process and any interactive TUI on the default port.
+      port,
+      timeout: SERVER_START_TIMEOUT_MS,
+      config: buildServerConfig(options.model, options.auto),
+    });
+    try {
+      await waitUntilReachable(opencode.server.url);
+      return opencode;
+    } catch (error) {
+      await stopOpencodeRuntime(opencode);
+      throw error;
+    }
+  });
+}
+
+export async function stopOpencodeRuntime(runtime: OpencodeRuntime | undefined): Promise<void> {
+  if (!runtime) return;
+  const url = runtime.server.url;
+  runtime.server.close();
+  await waitUntilUnreachable(url);
+  await delay(SQLITE_RELEASE_MS);
+}
+
 export async function listModels(): Promise<string[]> {
-  const opencode = await createOpencode();
+  const opencode = await startOpencodeRuntime({ auto: true });
   try {
     const res = await opencode.client.config.providers();
     if (!res.data) return [];
@@ -273,8 +311,21 @@ export async function listModels(): Promise<string[]> {
     }
     return ids.sort();
   } finally {
-    opencode.server.close();
+    await stopOpencodeRuntime(opencode);
   }
+}
+
+export function isTransientStartupError(error: unknown): boolean {
+  const msg = typeof error === "string"
+    ? error
+    : error instanceof Error
+      ? error.message
+      : String(error);
+  if (isTransientStartupMessage(msg)) return true;
+  if (error instanceof Error && error.cause !== undefined) {
+    return isTransientStartupError(error.cause);
+  }
+  return false;
 }
 
 function buildServerConfig(model: string | undefined, auto: boolean): Config {
@@ -384,6 +435,107 @@ function pendingPermissionFromListItem(item: unknown): PendingPermission | undef
       : "permission";
   if (!id || !sessionID) return undefined;
   return { id, sessionID, name };
+}
+
+async function createSession(client: OpencodeClient, cwd: string): Promise<string> {
+  return withTransientRetries("OpenCode session create", async () => {
+    const sessionRes = await client.session.create({
+      body: { title: "opencode-loop" },
+      query: { directory: cwd },
+    });
+    if (sessionRes.data) return sessionRes.data.id;
+    throw new Error(formatApiError(sessionRes.error) ?? "Failed to create session");
+  });
+}
+
+async function withTransientRetries<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientStartupError(error) || attempt === START_ATTEMPTS) {
+        throw error;
+      }
+      const waitMs = Math.min(START_RETRY_BASE_MS * 2 ** (attempt - 1), START_RETRY_MAX_MS);
+      const msg = error instanceof Error ? error.message : String(error);
+      const summary = msg.split("\n")[0]!.slice(0, 120);
+      console.error(`${label} failed (${summary}), retrying in ${waitMs}ms (${attempt}/${START_ATTEMPTS})`);
+      await delay(waitMs);
+    }
+  }
+  throw lastError;
+}
+
+function isTransientStartupMessage(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("fetch failed") ||
+    lower.includes("failed to fetch") ||
+    lower.includes("econnrefused") ||
+    lower.includes("econnreset") ||
+    lower.includes("eaddrinuse") ||
+    lower.includes("epipe") ||
+    lower.includes("socket hang up") ||
+    lower.includes("other side closed") ||
+    lower.includes("und_err_") ||
+    lower.includes("database is locked") ||
+    lower.includes("sqlite_busy") ||
+    lower.includes("sqlite_locked") ||
+    lower.includes("locking protocol") ||
+    lower.includes("timeout waiting for server") ||
+    /server exited with code/.test(lower) ||
+    /port .+ in use/.test(lower)
+  );
+}
+
+async function waitUntilReachable(url: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(url, { signal: AbortSignal.timeout(500) });
+      return;
+    } catch (error) {
+      lastError = error;
+      await delay(100);
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("OpenCode server did not become reachable");
+}
+
+async function waitUntilUnreachable(url: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(url, { signal: AbortSignal.timeout(250) });
+      await delay(100);
+    } catch {
+      return;
+    }
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function allocateListenPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      server.close(err => {
+        if (err || port === 0) reject(err ?? new Error("Failed to allocate a listen port"));
+        else resolve(port);
+      });
+    });
+    server.on("error", reject);
+  });
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

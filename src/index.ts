@@ -5,7 +5,15 @@ import { resolve } from "node:path";
 import { parseArgs, MAIN_HELP, type RunCommand } from "./args.js";
 import { loadPrompt, renderPrompt } from "./prompt.js";
 import { countUncheckedTasks, hasUncheckedTasks, pickFirstUncheckedTask } from "./task-picker.js";
-import { listModels, runFreshAgent, type StatusEvent } from "./sdk.js";
+import {
+  isTransientStartupError,
+  listModels,
+  runFreshAgent,
+  startOpencodeRuntime,
+  stopOpencodeRuntime,
+  type OpencodeRuntime,
+  type StatusEvent,
+} from "./sdk.js";
 
 async function main(): Promise<void> {
   const command = parseArgs(process.argv.slice(2));
@@ -38,78 +46,104 @@ async function run(command: RunCommand): Promise<void> {
     return;
   }
 
-  for (let iteration = 1; iteration <= maxIterations; iteration++) {
-    const task = taskFile ? await pickFirstUncheckedTask(taskFile) : undefined;
+  let runtime: OpencodeRuntime | undefined;
+  let exitCode = 0;
+  try {
+    runtime = await startOpencodeRuntime({ model: command.model, auto: command.auto });
 
-    if (taskFile && !task) {
-      console.log(`No unchecked tasks remain in ${taskFile}.`);
-      return;
+    for (let iteration = 1; iteration <= maxIterations; iteration++) {
+      const task = taskFile ? await pickFirstUncheckedTask(taskFile) : undefined;
+
+      if (taskFile && !task) {
+        console.log(`No unchecked tasks remain in ${taskFile}.`);
+        break;
+      }
+
+      const renderedPrompt = renderPrompt(promptTemplate, {
+        task,
+        taskFile,
+        iteration,
+        cwd,
+      });
+
+      console.log(`\nStarting fresh OpenCode agent (${formatIteration(iteration, displayedTotal)})`);
+      console.log(`cwd: ${cwd}`);
+      if (command.model) {
+        console.log(`model: ${command.model}`);
+      }
+      console.log(command.auto
+        ? "permissions: auto-approve (default — do not run this on a host you care about; --no-auto to disable)"
+        : "permissions: ask (the loop cannot answer prompts and will hang)");
+      if (task) {
+        console.log(`task: ${task.text} (${taskFile}:${task.line})`);
+      }
+
+      thinkingActive = false;
+
+      const outputDir = resolve(cwd, "opencode-loop-output");
+      await mkdir(outputDir, { recursive: true });
+      const replyFile = resolve(outputDir, `reply-${iteration}.md`);
+      let replyBuffer = "";
+
+      const invokeAgent = () => runFreshAgent({
+        prompt: renderedPrompt,
+        model: command.model,
+        cwd,
+        auto: command.auto,
+        runtime,
+        stream: (text) => {
+          process.stdout.write(text);
+          replyBuffer += text;
+        },
+        onStatus: (event) => writeStatus(event),
+      });
+
+      let outcome = await invokeAgent();
+
+      if (outcome.kind === "startup-error" && isTransientStartupError(outcome.error)) {
+        console.error(`OpenCode startup failed: ${outcome.error} — restarting OpenCode and retrying`);
+        await stopOpencodeRuntime(runtime);
+        runtime = undefined;
+        runtime = await startOpencodeRuntime({ model: command.model, auto: command.auto });
+        outcome = await invokeAgent();
+      }
+
+      endThinking();
+      process.stdout.write("\n");
+      await writeFile(replyFile, replyBuffer, "utf8");
+      console.log(`Reply saved to: ${replyFile}`);
+
+      if (outcome.kind === "startup-error") {
+        console.error(`OpenCode startup failed: ${outcome.error}`);
+        exitCode = 1;
+        break;
+      }
+
+      if (outcome.kind === "run-error") {
+        console.error(`OpenCode agent run failed: ${outcome.error}`);
+        exitCode = 2;
+        break;
+      }
+
+      console.log("OpenCode agent run finished.");
+
+      if (!taskFile) {
+        break;
+      }
+
+      if (!(await hasUncheckedTasks(taskFile))) {
+        console.log(`No unchecked tasks remain in ${taskFile}.`);
+        break;
+      }
     }
-
-    const renderedPrompt = renderPrompt(promptTemplate, {
-      task,
-      taskFile,
-      iteration,
-      cwd,
-    });
-
-    console.log(`\nStarting fresh OpenCode agent (${formatIteration(iteration, displayedTotal)})`);
-    console.log(`cwd: ${cwd}`);
-    if (command.model) {
-      console.log(`model: ${command.model}`);
-    }
-    console.log(command.auto
-      ? "permissions: auto-approve (default — do not run this on a host you care about; --no-auto to disable)"
-      : "permissions: ask (the loop cannot answer prompts and will hang)");
-    if (task) {
-      console.log(`task: ${task.text} (${taskFile}:${task.line})`);
-    }
-
-    thinkingActive = false;
-
-    const outputDir = resolve(cwd, "opencode-loop-output");
-    await mkdir(outputDir, { recursive: true });
-    const replyFile = resolve(outputDir, `reply-${iteration}.md`);
-    let replyBuffer = "";
-
-    const outcome = await runFreshAgent({
-      prompt: renderedPrompt,
-      model: command.model,
-      cwd,
-      auto: command.auto,
-      stream: (text) => {
-        process.stdout.write(text);
-        replyBuffer += text;
-      },
-      onStatus: (event) => writeStatus(event),
-    });
-
-    endThinking();
-    process.stdout.write("\n");
-    await writeFile(replyFile, replyBuffer, "utf8");
-    console.log(`Reply saved to: ${replyFile}`);
-
-    if (outcome.kind === "startup-error") {
-      console.error(`OpenCode startup failed: ${outcome.error}`);
-      process.exit(1);
-    }
-
-    if (outcome.kind === "run-error") {
-      console.error(`OpenCode agent run failed: ${outcome.error}`);
-      process.exit(2);
-    }
-
-    console.log("OpenCode agent run finished.");
-
-    if (!taskFile) {
-      return;
-    }
-
-    if (!(await hasUncheckedTasks(taskFile))) {
-      console.log(`No unchecked tasks remain in ${taskFile}.`);
-      return;
-    }
+  } catch (error) {
+    console.error(`OpenCode startup failed: ${formatError(error)}`);
+    exitCode = 1;
+  } finally {
+    await stopOpencodeRuntime(runtime);
   }
+
+  if (exitCode !== 0) process.exit(exitCode);
 }
 
 function formatIteration(iteration: number, limit: number): string {
