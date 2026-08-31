@@ -58,6 +58,9 @@ async function run(command: RunCommand): Promise<void> {
     if (command.model) {
       console.log(`model: ${command.model}`);
     }
+    console.log(command.auto
+      ? "permissions: auto-approve (default — do not run this on a host you care about; --no-auto to disable)"
+      : "permissions: ask (the loop cannot answer prompts and will hang)");
     if (task) {
       console.log(`task: ${task.text} (${taskFile}:${task.line})`);
     }
@@ -73,6 +76,7 @@ async function run(command: RunCommand): Promise<void> {
       prompt: renderedPrompt,
       model: command.model,
       cwd,
+      auto: command.auto,
       stream: (text) => {
         process.stdout.write(text);
         replyBuffer += text;
@@ -184,6 +188,23 @@ function writeStatus(event: StatusEvent): void {
         ? event.files.join(", ")
         : `${event.files.slice(0, 3).join(", ")} +${event.files.length - 3} more`;
       process.stderr.write(`\n${yellow("⚡")} files changed: ${fileList}`);
+      break;
+    }
+    case "permission-auto": {
+      endThinking();
+      process.stderr.write(`\n${yellow("⚡")} auto-approved ${event.permission}`);
+      break;
+    }
+    case "permission-ask": {
+      endThinking();
+      process.stderr.write(
+        `\n${yellow("⚠")} permission ask: ${event.permission} (loop cannot approve; it will hang — drop --no-auto)`,
+      );
+      break;
+    }
+    case "permission-error": {
+      endThinking();
+      process.stderr.write(`\n${red("✗")} permission ${event.permission}: ${event.error}`);
       break;
     }
   }

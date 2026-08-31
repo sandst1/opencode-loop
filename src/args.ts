@@ -8,6 +8,8 @@ export interface RunCommand {
   model?: string;
   limit?: number;
   cwd: string;
+  /** Auto-approve OpenCode permission prompts. Default: true. */
+  auto: boolean;
 }
 
 export interface ModelsCommand {
@@ -40,6 +42,8 @@ Flags:
                                Defaults to the model set in your opencode.json config.
   --limit <number>             Maximum task iterations. Without --pick-tasks-from, the prompt runs once.
   --cwd <path>                 Working directory passed to OpenCode. Default: current directory.
+  --auto                       Auto-approve OpenCode permission prompts (default).
+  --no-auto                    Leave permission prompts unanswered. The loop will hang on ask.
   --help                       Show this help.
 
 Prompt template variables:
@@ -58,7 +62,10 @@ If --pick-tasks-from is set without --prompt or --prompt-file, opencode-loop use
 generic one-task prompt that asks the agent to complete {{task}} and update the
 checkbox when done. With --pick-tasks-from and no --limit, opencode-loop keeps
 selecting the next unchecked task until none remain. Progress is shown against
-the number of unchecked tasks found at startup.`;
+the number of unchecked tasks found at startup.
+
+Permission prompts are auto-approved by default. Do not run this on a host you
+care about — use a sandbox (for example agent-vm). Pass --no-auto to disable.`;
 
 export function parseArgs(argv: string[]): Command {
   const [command, ...rest] = argv;
@@ -79,6 +86,7 @@ function parseRun(args: string[]): RunCommand | HelpCommand {
   const command: RunCommand = {
     name: "run",
     cwd: process.cwd(),
+    auto: true,
   };
 
   for (let index = 0; index < args.length; index++) {
@@ -111,6 +119,12 @@ function parseRun(args: string[]): RunCommand | HelpCommand {
       }
       case "--cwd":
         command.cwd = readFlagValue(args, ++index, arg);
+        break;
+      case "--auto":
+        command.auto = true;
+        break;
+      case "--no-auto":
+        command.auto = false;
         break;
       default:
         throw new Error(`Unknown flag: ${arg}`);

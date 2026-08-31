@@ -1,4 +1,4 @@
-import { createOpencode } from "@opencode-ai/sdk";
+import { createOpencode, type Config, type OpencodeClient } from "@opencode-ai/sdk";
 
 export type StatusEvent =
   | { kind: "thinking"; text: string }
@@ -7,15 +7,28 @@ export type StatusEvent =
   | { kind: "tool-completed"; tool: string; title: string }
   | { kind: "tool-error"; tool: string; error: string }
   | { kind: "step-finish"; tokens: { input: number; output: number; reasoning: number } }
-  | { kind: "file-patch"; files: string[] };
+  | { kind: "file-patch"; files: string[] }
+  | { kind: "permission-auto"; permission: string }
+  | { kind: "permission-ask"; permission: string }
+  | { kind: "permission-error"; permission: string; error: string };
 
 export interface RunAgentOptions {
   prompt: string;
   model?: string;
   cwd: string;
+  /** Auto-approve OpenCode permission prompts. Default: true. */
+  auto?: boolean;
   stream?: (text: string) => void;
   onStatus?: (event: StatusEvent) => void;
 }
+
+const ALLOW_PERMISSION = {
+  edit: "allow",
+  bash: "allow",
+  webfetch: "allow",
+  doom_loop: "allow",
+  external_directory: "allow",
+} as const;
 
 export type AgentRunOutcome =
   | { kind: "finished" }
@@ -24,12 +37,15 @@ export type AgentRunOutcome =
 
 export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunOutcome> {
   let opencode: Awaited<ReturnType<typeof createOpencode>> | undefined;
+  let controller: AbortController | undefined;
 
   try {
+    const auto = options.auto !== false;
     opencode = await createOpencode({
-      config: options.model ? { model: options.model } : {},
+      config: buildServerConfig(options.model, auto),
     });
     const { client } = opencode;
+    const serverUrl = opencode.server.url;
 
     const sessionRes = await client.session.create({
       body: { title: "opencode-loop" },
@@ -44,7 +60,7 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
     const sessionId = sessionRes.data.id;
     const parsedModel = options.model ? parseModel(options.model) : undefined;
 
-    const controller = new AbortController();
+    controller = new AbortController();
     const { stream } = await client.event.subscribe({ signal: controller.signal });
 
     // Signals used to coordinate the background consumer with the main flow.
@@ -60,12 +76,42 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
     const partOffsets = new Map<string, number>();
     // Parts seen so far — used to insert a newline between distinct parts.
     const seenParts = new Set<string>();
+    const handledPermissionIds = new Set<string>();
+
+    const handlePermissionAsk = async (request: PendingPermission): Promise<void> => {
+      if (request.sessionID !== sessionId) return;
+      if (handledPermissionIds.has(request.id)) return;
+      handledPermissionIds.add(request.id);
+
+      if (!auto) {
+        options.onStatus?.({ kind: "permission-ask", permission: request.name });
+        return;
+      }
+
+      options.onStatus?.({ kind: "permission-auto", permission: request.name });
+      const error = await replyPermissionAlways({
+        client,
+        serverUrl,
+        sessionId,
+        permissionId: request.id,
+        cwd: options.cwd,
+      });
+      if (error) {
+        options.onStatus?.({ kind: "permission-error", permission: request.name, error });
+      }
+    };
 
     // Start consuming SSE events as a background task. Doing this before
     // calling promptAsync ensures the SSE fetch is already in-flight (and we
     // wait for server.connected below) so we can't miss any events.
     const consumeTask = (async () => {
       for await (const event of stream) {
+        const permissionAsk = pendingPermissionFromEvent(event);
+        if (permissionAsk) {
+          await handlePermissionAsk(permissionAsk);
+          continue;
+        }
+
         if (event.type === "server.connected") {
           resolveConnected();
         } else if (event.type === "message.updated") {
@@ -140,6 +186,13 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
       new Promise<void>(r => setTimeout(r, 3000)), // fallback if server.connected is missing
     ]);
 
+    const pollTask = pollPendingPermissions({
+      serverUrl,
+      cwd: options.cwd,
+      signal: controller.signal,
+      onAsk: handlePermissionAsk,
+    });
+
     const promptRes = await client.session.promptAsync({
       path: { id: sessionId },
       body: {
@@ -151,14 +204,14 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
 
     if (promptRes.error) {
       controller.abort();
-      await consumeTask;
+      await Promise.allSettled([consumeTask, pollTask]);
       return { kind: "run-error", error: formatApiError(promptRes.error) ?? "Prompt rejected" };
     }
 
     // Wait for session.idle (or session.error) via the background consumer.
     const errorMessage = await idlePromise;
     controller.abort();
-    await consumeTask;
+    await Promise.allSettled([consumeTask, pollTask]);
 
     if (errorMessage) {
       return { kind: "run-error", error: errorMessage };
@@ -201,6 +254,7 @@ export async function runFreshAgent(options: RunAgentOptions): Promise<AgentRunO
       error: error instanceof Error ? error.message : String(error),
     };
   } finally {
+    controller?.abort();
     opencode?.server.close();
   }
 }
@@ -221,6 +275,129 @@ export async function listModels(): Promise<string[]> {
   } finally {
     opencode.server.close();
   }
+}
+
+function buildServerConfig(model: string | undefined, auto: boolean): Config {
+  const config: Config = {};
+  if (model) config.model = model;
+  if (!auto) return config;
+
+  // String "allow" is the OpenCode 1.1+ YOLO form. Agent-level keys cover the
+  // case where the built-in `build` agent still defaults external_directory to ask.
+  return {
+    ...config,
+    permission: "allow",
+    agent: {
+      build: { permission: { ...ALLOW_PERMISSION } },
+    },
+  } as Config;
+}
+
+interface PendingPermission {
+  id: string;
+  sessionID: string;
+  name: string;
+}
+
+function pendingPermissionFromEvent(event: { type: string; properties?: unknown }): PendingPermission | undefined {
+  if (event.type !== "permission.updated" && event.type !== "permission.asked") {
+    return undefined;
+  }
+  if (!event.properties || typeof event.properties !== "object") return undefined;
+  const properties = event.properties as Record<string, unknown>;
+  const id = typeof properties["id"] === "string" ? properties["id"] : undefined;
+  const sessionID = typeof properties["sessionID"] === "string" ? properties["sessionID"] : undefined;
+  const name = typeof properties["permission"] === "string"
+    ? properties["permission"]
+    : typeof properties["type"] === "string"
+      ? properties["type"]
+      : "permission";
+  if (!id || !sessionID) return undefined;
+  return { id, sessionID, name };
+}
+
+async function replyPermissionAlways(options: {
+  client: OpencodeClient;
+  serverUrl: string;
+  sessionId: string;
+  permissionId: string;
+  cwd: string;
+}): Promise<string | undefined> {
+  const replyUrl = new URL(`/permission/${encodeURIComponent(options.permissionId)}/reply`, options.serverUrl);
+  replyUrl.searchParams.set("directory", options.cwd);
+  try {
+    const res = await fetch(replyUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reply: "always" }),
+    });
+    if (res.ok) return undefined;
+  } catch {
+    // Fall through to the older session-scoped reply endpoint.
+  }
+
+  const legacy = await options.client.postSessionIdPermissionsPermissionId({
+    path: { id: options.sessionId, permissionID: options.permissionId },
+    body: { response: "always" },
+    query: { directory: options.cwd },
+  });
+  if (legacy.error) return formatApiError(legacy.error) ?? "permission reply failed";
+  return undefined;
+}
+
+async function pollPendingPermissions(options: {
+  serverUrl: string;
+  cwd: string;
+  signal: AbortSignal;
+  onAsk: (request: PendingPermission) => Promise<void>;
+}): Promise<void> {
+  while (!options.signal.aborted) {
+    try {
+      const url = new URL("/permission", options.serverUrl);
+      url.searchParams.set("directory", options.cwd);
+      const res = await fetch(url, { signal: options.signal });
+      if (res.ok) {
+        const payload: unknown = await res.json();
+        const items = Array.isArray(payload) ? payload : [];
+        for (const item of items) {
+          const request = pendingPermissionFromListItem(item);
+          if (request) await options.onAsk(request);
+        }
+      }
+    } catch (error) {
+      if (options.signal.aborted) return;
+      if (error instanceof Error && error.name === "AbortError") return;
+    }
+    await sleep(500, options.signal);
+  }
+}
+
+function pendingPermissionFromListItem(item: unknown): PendingPermission | undefined {
+  if (!item || typeof item !== "object") return undefined;
+  const record = item as Record<string, unknown>;
+  const id = typeof record["id"] === "string" ? record["id"] : undefined;
+  const sessionID = typeof record["sessionID"] === "string" ? record["sessionID"] : undefined;
+  const name = typeof record["permission"] === "string"
+    ? record["permission"]
+    : typeof record["type"] === "string"
+      ? record["type"]
+      : "permission";
+  if (!id || !sessionID) return undefined;
+  return { id, sessionID, name };
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
 }
 
 function parseModel(model: string): { providerID: string; modelID: string } | undefined {

@@ -4,6 +4,21 @@ Run fresh OpenCode agents from a Node command line app.
 
 `opencode-loop` is for repetitive task lists where each step should get a clean agent context. The durable state lives in your files — usually a prompt file and a markdown task list.
 
+## Permissions — auto-approve is on by default
+
+**Do not run this on a machine you care about.** There is no confirmation UI. Every OpenCode permission prompt (`bash`, `edit`, `external_directory`, `doom_loop`, …) is approved automatically so an unattended loop cannot freeze waiting for a human.
+
+That is the point of this tool. Put it in a sandbox (for example [agent-vm](https://github.com/sandst1/agent-vm)) and treat the VM as the trust boundary.
+
+- `--auto` is the default and can be passed explicitly.
+- `--no-auto` leaves prompts unanswered. The loop **will hang** the first time OpenCode asks (this is how `external_directory` presents). Only use it if something else will reply.
+
+A line is printed at the start of each iteration so the mode is visible:
+
+```
+permissions: auto-approve (default — do not run this on a host you care about; --no-auto to disable)
+```
+
 ## Requirements
 
 - Node.js 20+
@@ -66,6 +81,12 @@ Limit how many checkbox tasks to run:
 opencode-loop --prompt-file prompt.md --pick-tasks-from docs/task-plan.md --limit 3
 ```
 
+Leave permission prompts to OpenCode (the loop will hang if anything asks):
+
+```bash
+opencode-loop --no-auto --prompt "Review README.md and fix obvious typos."
+```
+
 List available models (from your configured providers):
 
 ```bash
@@ -95,7 +116,9 @@ If `--model` is omitted, OpenCode uses the `model` field from your `opencode.jso
 3. `OPENCODE_CONFIG` env var override
 4. Project config (`opencode.json` in the working directory)
 
-This means your provider keys, default model, permissions, MCP servers, and other settings all work out of the box.
+This means your provider keys, default model, MCP servers, and other settings all work out of the box.
+
+Permission prompts are **not** taken from that config as-is. `--auto` (the default) auto-approves them for the loop process only — it does not change your interactive OpenCode TUI.
 
 ## Task Files
 
